@@ -5,6 +5,13 @@ Go 1.26+ proxy server providing OpenAI/Gemini/Claude/Codex compatible APIs with 
 ## Repository
 - GitHub: https://github.com/router-for-me/CLIProxyAPI
 
+## Local Workflow
+- `main` is reserved for syncing with `upstream/main`; avoid keeping personal feature work or local-only assets on `main`
+- Personal work should usually live on `local/self-use`, or on topic branches created from the latest `main`
+- `.trellis/` is a local workflow asset in this clone and should stay untracked; keep local ignore rules in `.git/info/exclude` instead of changing shared ignore files for personal-only paths
+- Before syncing from upstream, switch to `main`, keep the working tree clean, and update that branch first; resume personal work from your local branch afterward
+- If a local-only convention becomes worth sharing, extract the stable part into regular project docs instead of committing the whole `.trellis/` workspace
+
 ## Commands
 ```bash
 gofmt -w . # Format (required after Go changes)
