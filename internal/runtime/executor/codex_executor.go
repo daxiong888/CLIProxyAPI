@@ -14,6 +14,7 @@ import (
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/fastpath"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -163,8 +164,25 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+
+	// Fast-path gate: use optimized mapper for Claude → Codex when eligible.
+	var usedFastPath bool
+	var fpMapper fastpath.FormatMapper
+	var body, originalTranslated []byte
+	if mapper := fastpath.GetMapper(from.String(), to.String()); mapper != nil {
+		if eligible, _ := mapper.IsEligible(req.Payload); eligible {
+			b, ot, mapErr := mapper.MapRequest(req.Payload, originalPayload, baseModel)
+			if mapErr == nil {
+				body, originalTranslated = b, ot
+				fpMapper = mapper
+				usedFastPath = true
+			}
+		}
+	}
+	if !usedFastPath {
+		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
+		body = sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -286,8 +304,16 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			completedData = completedDataPatched
 		}
 
-		var param any
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, completedData, &param)
+		var out []byte
+		if usedFastPath && fpMapper != nil {
+			if fpOut, fpErr := fpMapper.MapNonStreamResponse(originalPayload, completedData); fpErr == nil {
+				out = fpOut
+			}
+		}
+		if len(out) == 0 {
+			var param any
+			out = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, completedData, &param)
+		}
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
@@ -404,8 +430,25 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+
+	// Fast-path gate: use optimized mapper for Claude → Codex when eligible.
+	var usedFastPath bool
+	var fpBridge fastpath.StreamBridge
+	var body, originalTranslated []byte
+	if mapper := fastpath.GetMapper(from.String(), to.String()); mapper != nil {
+		if eligible, _ := mapper.IsEligible(req.Payload); eligible {
+			b, ot, mapErr := mapper.MapRequest(req.Payload, originalPayload, baseModel)
+			if mapErr == nil {
+				body, originalTranslated = b, ot
+				fpBridge = mapper.NewStreamBridge(originalPayload)
+				usedFastPath = true
+			}
+		}
+	}
+	if !usedFastPath {
+		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
+		body = sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	}
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -466,7 +509,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		err = newCodexStatusErr(httpResp.StatusCode, data)
 		return nil, err
 	}
-	out := make(chan cliproxyexecutor.StreamChunk)
+	out := make(chan cliproxyexecutor.StreamChunk, 8)
 	go func() {
 		defer close(out)
 		defer func() {
@@ -498,15 +541,36 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
+			var chunks [][]byte
+			if fpBridge != nil {
+				chunks = fpBridge.ProcessLine(ctx, translatedLine)
+			} else {
+				chunks = sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
+			}
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+		if fpBridge != nil {
+			for _, chunk := range fpBridge.Finalize() {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case <-ctx.Done():
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil

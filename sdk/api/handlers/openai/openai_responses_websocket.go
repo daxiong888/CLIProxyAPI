@@ -103,16 +103,19 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// )
 		appendWebsocketTimelineEvent(&wsTimelineLog, "request", payload, time.Now())
 
+		requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+		if requestModelName == "" {
+			requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+		}
 		allowIncrementalInputWithPreviousResponseID := false
 		if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
-			if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil {
-				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
+			if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil && responsesWebsocketAuthSupportsIncrementalInputForModel(pinnedAuth, requestModelName, time.Now()) {
+				allowIncrementalInputWithPreviousResponseID = true
+			} else {
+				// Drop stale websocket pinning when the selected upstream can no longer continue this turn.
+				pinnedAuthID = ""
 			}
 		} else {
-			requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-			if requestModelName == "" {
-				requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
-			}
 			allowIncrementalInputWithPreviousResponseID = h.websocketUpstreamSupportsIncrementalInputForModel(requestModelName)
 		}
 
@@ -477,6 +480,16 @@ func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, met
 	default:
 	}
 	return false
+}
+
+func responsesWebsocketAuthSupportsIncrementalInputForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	if !websocketUpstreamSupportsIncrementalInput(auth.Attributes, auth.Metadata) {
+		return false
+	}
+	return responsesWebsocketAuthAvailableForModel(auth, modelName, now)
 }
 
 func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputForModel(modelName string) bool {

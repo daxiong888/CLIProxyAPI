@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/fastpath"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -94,19 +95,37 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
+
+	// Fast-path gate: use optimized mapper for Claude -> OpenAI when eligible.
+	var usedFastPath bool
+	var fpMapper fastpath.FormatMapper
+	var translated, originalTranslated []byte
+	if mapper := fastpath.GetMapper(from.String(), to.String()); mapper != nil {
+		if eligible, _ := mapper.IsEligible(req.Payload); eligible {
+			b, ot, mapErr := mapper.MapRequest(req.Payload, originalPayload, baseModel)
+			if mapErr == nil {
+				translated, originalTranslated = b, ot
+				fpMapper = mapper
+				usedFastPath = true
+			}
+		}
+	}
+	if !usedFastPath {
+		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
+		translated = sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
+	}
+
+	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return resp, err
+	}
+
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
 		}
-	}
-
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
-	if err != nil {
-		return resp, err
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -168,11 +187,18 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
-	// Ensure we at least record the request even if upstream doesn't return usage
 	reporter.EnsurePublished(ctx)
-	// Translate response back to source format when needed
-	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, body, &param)
+
+	var out []byte
+	if usedFastPath && fpMapper != nil {
+		if fpOut, fpErr := fpMapper.MapNonStreamResponse(originalPayload, body); fpErr == nil {
+			out = fpOut
+		}
+	}
+	if len(out) == 0 {
+		var param any
+		out = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, body, &param)
+	}
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -196,18 +222,34 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
+
+	// Fast-path gate: use optimized mapper for Claude -> OpenAI when eligible.
+	var fpBridge fastpath.StreamBridge
+	var translated, originalTranslated []byte
+	if mapper := fastpath.GetMapper(from.String(), to.String()); mapper != nil {
+		if eligible, _ := mapper.IsEligible(req.Payload); eligible {
+			b, ot, mapErr := mapper.MapRequest(req.Payload, originalPayload, baseModel)
+			if mapErr == nil {
+				translated, originalTranslated = b, ot
+				fpBridge = mapper.NewStreamBridge(originalPayload)
+			}
+		}
+	}
+	if fpBridge == nil {
+		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
+		translated = sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	}
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
 
-	// Request usage data in the final streaming chunk so that token statistics
-	// are captured even when the upstream is an OpenAI-compatible provider.
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
+
+	// Ensure stream mode and request usage data in the final streaming chunk.
+	translated, _ = sjson.SetBytes(translated, "stream", true)
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
@@ -262,7 +304,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return nil, err
 	}
-	out := make(chan cliproxyexecutor.StreamChunk)
+	out := make(chan cliproxyexecutor.StreamChunk, 8)
 	go func() {
 		defer close(out)
 		defer func() {
@@ -283,31 +325,58 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				continue
 			}
 
-			if !bytes.HasPrefix(line, []byte("data:")) {
-				continue
+			var chunks [][]byte
+			if fpBridge != nil {
+				chunks = fpBridge.ProcessLine(ctx, bytes.Clone(line))
+			} else {
+				if !bytes.HasPrefix(line, []byte("data:")) {
+					continue
+				}
+				chunks = sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(line), &param)
 			}
-
-			// OpenAI-compatible streams are SSE: lines typically prefixed with "data: ".
-			// Pass through translator; it yields one or more chunks for the target schema.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(line), &param)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case <-ctx.Done():
+			}
 		} else {
-			// In case the upstream close the stream without a terminal [DONE] marker.
-			// Feed a synthetic done marker through the translator so pending
-			// response.completed events are still emitted exactly once.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
-			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+			// Feed a synthetic [DONE] so pending close events are emitted.
+			if fpBridge != nil {
+				for _, chunk := range fpBridge.ProcessLine(ctx, []byte("data: [DONE]")) {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
+					case <-ctx.Done():
+						return
+					}
+				}
+				for _, chunk := range fpBridge.Finalize() {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			} else {
+				chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-ctx.Done():
+						return
+					}
+				}
 			}
 		}
-		// Ensure we record the request if no usage chunk was ever seen
 		reporter.EnsurePublished(ctx)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
